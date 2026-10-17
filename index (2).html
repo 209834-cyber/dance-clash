@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Undead Disco</title>
+<style>
+  :root{--bg:#12061f;--pink:#ff3fa4;--cyan:#3ff0e0;--gold:#ffd23f;--ink:#f4eeff}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:"Trebuchet MS","Segoe UI",system-ui,sans-serif}
+  body{display:flex;align-items:center;justify-content:center}
+  #wrap{position:relative;width:min(100vw,calc(100vh*960/680));aspect-ratio:960/680}
+  canvas{width:100%;height:100%;display:block;background:#000;cursor:crosshair;box-shadow:0 0 60px rgba(255,63,164,.35)}
+  #overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(18,6,31,.92);text-align:center;padding:24px}
+  #overlay h1{margin:0;font-size:clamp(32px,7vw,72px);font-style:italic;color:var(--pink);text-shadow:3px 3px 0 var(--cyan)}
+  #overlay p{margin:0;max-width:56ch;line-height:1.5;font-size:clamp(13px,1.9vw,17px)}
+  button{font:inherit;font-weight:700;font-size:20px;padding:12px 32px;border:0;border-radius:6px;background:var(--gold);color:#2a0a3a;cursor:pointer}
+  button:focus-visible{outline:3px solid var(--cyan);outline-offset:3px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="960" height="680"></canvas>
+  <div id="overlay">
+    <h1>Undead Disco</h1>
+    <p><b>WASD / arrows</b> move. <b>Left click</b> strikes toward your cursor (every third hit is a heavy hit with reach and knockback). <b>Right click</b> dashes through enemies and dodges damage. <b>Space</b> spins around you.</p>
+    <p>On-beat actions fill your groove meter. Spend it on power moves: <b>Q</b> floor blast, <b>E</b> mirrorball beam, <b>R</b> disco inferno. Anything off the beat fizzles and breaks your combo.</p>
+    <p>Watch for orange bombers, red spitter lines and a boss every fifth wave. Pickups: ♥ heal, ♪ groove, ◈ shield. <b>P</b> pauses, <b>M</b> mutes.</p>
+    <p>A self-tuning <b>AI director</b> watches how you play: it eases off when you struggle, pushes when you cruise, sends more of what hurts you, and its enemies learn your habits. It remembers between runs.</p>
+    <button id="go">Start dancing</button>
+  </div>
+</div>
+<script>
+(() => {
+  const cv = document.getElementById('c'), g = cv.getContext('2d');
+  const overlay = document.getElementById('overlay'), goBtn = document.getElementById('go');
+  const T = 64, COLS = 15, ROWS = 8, TOP = 64, W = 960, H = 680;
+  const BPM = 112, BL = 60 / BPM, WINDOW = 0.11, PERFECT = 0.05;
+  const HUES = [320, 180, 48, 275];
+  const RING = [[1,0],[1,1],[0,1],[-1,1],[-1,0],[-1,-1],[0,-1],[1,-1]];
+  const DEF = { Z:{hp:1,every:2,pts:10}, R:{hp:1,every:1,pts:15}, B:{hp:3,every:2,pts:40}, S:{hp:1,every:2,pts:25}, X:{hp:2,every:2,pts:30}, K:{hp:1,every:2,pts:500} };
+  const COST = { blast:35, beam:50, inferno:100 };
+  const FONT = '"Trebuchet MS",sans-serif';
+
+  let ac, t0, nextSched, lastBeat, running = false, over = false;
+  let P, enemies, fx, msgs, items, score, combo, chain, hp, kills, wave, best = 0, shake = 0, dashReady = 0, paused = false, muted = false, master;
+  try { best = +localStorage.getItem('ud_best') || 0; } catch (e) {}
+  let mouse = { x: 480, y: 300 };
+
+  /* ---------- audio ---------- */
+  function tone(type, f1, f2, t, dur, vol) {
+    const o = ac.createOscillator(), v = ac.createGain();
+    o.type = type; o.frequency.setValueAtTime(f1, t);
+    if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    v.gain.setValueAtTime(vol, t); v.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(v).connect(master); o.start(t); o.stop(t + dur);
+  }
+  function noise(t, dur, vol, hp) {
+    const n = ac.sampleRate * dur, b = ac.createBuffer(1, n, ac.sampleRate), d = b.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    const s = ac.createBufferSource(), f = ac.createBiquadFilter(), v = ac.createGain();
+    s.buffer = b; f.type = 'highpass'; f.frequency.value = hp;
+    v.gain.setValueAtTime(vol, t); v.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    s.connect(f).connect(v).connect(master); s.start(t);
+  }
+  const BASS = [55, 55, 82.4, 55, 73.4, 73.4, 82.4, 98], ARP = [440, 554, 659, 554];
+  function schedule(beat, t) {
+    tone('sine', 150, 40, t, 0.25, 0.9);
+    noise(t + BL / 2, 0.05, 0.12, 7000);
+    if (beat % 2 === 1) noise(t, 0.12, 0.25, 1500);
+    tone('sawtooth', BASS[beat % 8] * 2, 0, t + BL / 2, 0.18, 0.12);
+    if (wave >= 3) tone('square', ARP[beat % 4], 0, t + BL / 4, 0.1, 0.04);   // extra layer from wave 3
+    if (wave >= 5) tone('square', ARP[(beat + 2) % 4] * 2, 0, t + BL * 3 / 4, 0.1, 0.03);
+  }
+  function pumpAudio() {
+    while (t0 + nextSched * BL < ac.currentTime + 0.25) { schedule(nextSched, t0 + nextSched * BL); nextSched++; }
+  }
+  const sfx = (f, type = 'square', d = 0.12, v = 0.15) => tone(type, f, f / 2, ac.currentTime, d, v);
+
+  /* ---------- helpers ---------- */
+  const pos = () => (ac.currentTime - t0) / BL;
+  const phase = () => { const p = pos(); return p - Math.floor(p); };
+  const judge = () => { const p = pos(); return Math.abs(p - Math.round(p)) * BL; };
+  const cx = x => x * T + T / 2, cy = y => TOP + y * T + T / 2;
+  const inB = (x, y) => x >= 0 && y >= 0 && x < COLS && y < ROWS;
+  const at = (x, y) => enemies.find(e => !e.dead && e.x === x && e.y === y);
+  const occupied = (x, y) => !!at(x, y) || (P.x === x && P.y === y);
+  const say = (text, x, y, color) => msgs.push({ text, x, y, color, life: 1 });
+  const gain = v => { P.groove = Math.min(100, P.groove + v); };
+
+  /* ---------- AI director: learns how you play, retunes the game, remembers across runs ---------- */
+  const AI = (() => {
+    const KEY = 'ud_ai_v1', TYPES = ['Z', 'R', 'X', 'B', 'S'];
+    const NAMES = { Z: 'zombies', R: 'runners', X: 'bombers', B: 'brutes', S: 'spitters' };
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const fresh = () => ({ start: 1, weak: { Z: .2, R: .2, X: .2, B: .2, S: .2 }, runs: [] });
+    let mem = fresh(), I = 1, run = null;
+    try { const m = JSON.parse(localStorage.getItem(KEY)); if (m && m.weak && Array.isArray(m.runs)) mem = m; } catch (e) {}
+    const save = () => { try { localStorage.setItem(KEY, JSON.stringify(mem)); } catch (e) {} };
+    addEventListener('pagehide', save);
+    return {
+      get I() { return I; },
+      save,
+      begin() {                                    // each run starts at the difficulty learned from past runs
+        I = mem.start;
+        run = { beats: 0, hits: [], moves: [], sum: 0, n: 0, acc: 0.8 };
+      },
+      note(ok) { run.acc = run.acc * 0.9 + (ok ? 0.1 : 0); },     // rhythm accuracy (moving average)
+      noteMove(dir) { run.moves.push(dir); if (run.moves.length > 10) run.moves.shift(); },
+      hit(src) {                                   // learn which enemy type hurts this player most
+        run.hits.push(run.beats);
+        if (TYPES.includes(src)) for (const t of TYPES) mem.weak[t] = mem.weak[t] * 0.92 + (t === src ? 0.08 : 0);
+      },
+      tick(hp) {                                   // live feedback loop: keep the player in the flow zone
+        run.beats++;
+        if (run.beats % 8) return;
+        const recent = run.hits.filter(b => run.beats - b < 32).length;
+        let d = 0;
+        if (recent >= 2 || hp <= 2) d = -0.07;                                 // struggling: ease off
+        else if (!recent && hp >= 4 && run.acc > 0.6) d = 0.05;                // cruising: push harder
+        else if (run.acc < 0.5) d = -0.03;                                     // can't find the beat: ease off
+        I = clamp(I + d, 0.6, 1.7); run.sum += I; run.n++;
+      },
+      mix(t) { return 0.8 + 1.2 * (mem.weak[t] ?? 0.2); },                     // spawn more of what you handle worst
+      aimPoint() {                                 // enemies lead their target using your movement habits
+        const c = {}; let best = null, bn = 0;
+        for (const m of run.moves) { const k = m.join(); c[k] = (c[k] || 0) + 1; if (c[k] > bn) { bn = c[k]; best = m; } }
+        if (best && bn >= 4 && Math.random() < clamp((I - 0.6) * 0.7, 0, 0.7))
+          return { x: clamp(P.x + best[0], 0, COLS - 1), y: clamp(P.y + best[1], 0, ROWS - 1) };
+        return { x: P.x, y: P.y };
+      },
+      endRun(w, k, sc) {                           // retune the starting difficulty for next time
+        const avg = run.n ? run.sum / run.n : I;
+        let target = 0.5 * avg + 0.5 * I;
+        if (run.beats < 60) target -= 0.1;
+        mem.start = clamp(0.6 * mem.start + 0.4 * target, 0.7, 1.4);
+        mem.runs.push({ beats: run.beats, wave: w, kills: k, score: sc, I: +I.toFixed(2) });
+        if (mem.runs.length > 20) mem.runs.shift();
+        save();
+      },
+      report() {
+        const w = Object.entries(mem.weak).sort((a, b) => b[1] - a[1])[0];
+        const weak = w[1] > 0.26 ? NAMES[w[0]] : 'none yet';
+        return 'director x' + I.toFixed(2) + '   |   next run starts x' + mem.start.toFixed(2) + '   |   your weak spot: ' + weak;
+      },
+      forget() { mem = fresh(); save(); }
+    };
+  })();
+
+  function reset() {
+    P = { x: 7, y: 4, face: [1, 0], flash: 0, inv: -1, groove: 0, shield: 0 };
+    enemies = []; fx = []; msgs = []; items = []; paused = false;
+    score = 0; combo = 0; chain = 0; hp = 5; kills = 0; wave = 1; over = false; dashReady = 0;
+    AI.begin();
+  }
+
+  const mk = (type, x, y) => {
+    const h = type === 'K' ? 10 + wave * 2 : DEF[type].hp;
+    return { x, y, type, hp: h, max: h, hue: 100 + Math.random() * 40, hop: 0, flash: 0, charge: false, off: type === 'S' || type === 'K' ? 0 : Math.round(Math.random()) };
+  };
+  function spawnBoss() {
+    for (const [x, y] of [[7, 0], [6, 0], [8, 0], [7, 1]]) if (!occupied(x, y)) { enemies.push(mk('K', x, y)); return; }
+  }
+  function spawn() {
+    const base = wave >= 4 ? { S: .12, B: .14, X: .14, R: .15, Z: .45 } : wave === 3 ? { B: .26, X: .14, R: .15, Z: .45 } : wave === 2 ? { X: .40, R: .15, Z: .45 } : { Z: 1 };
+    let tot = 0; const wts = Object.entries(base).map(([t, w]) => [t, w * AI.mix(t)]);
+    for (const [, w] of wts) tot += w;
+    let r = Math.random() * tot, type = 'Z';
+    for (const [t, w] of wts) { if ((r -= w) < 0) { type = t; break; } }
+    for (let i = 0; i < 20; i++) {
+      const side = Math.floor(Math.random() * 4);
+      const x = side < 2 ? (side ? COLS - 1 : 0) : Math.floor(Math.random() * COLS);
+      const y = side < 2 ? Math.floor(Math.random() * ROWS) : (side === 2 ? 0 : ROWS - 1);
+      if (!occupied(x, y)) {
+        enemies.push(mk(type, x, y));
+        return;
+      }
+    }
+  }
+
+  function hurt(dmg, n, src) {
+    if (n <= P.inv) return;
+    if (P.shield) { P.shield = 0; P.inv = n; say('BLOCKED', cx(P.x), TOP + P.y * T, '#3ff0e0'); sfx(700, 'sine', 0.2, 0.2); return; }
+    hp -= dmg; combo = 0; chain = 0; shake = 12; P.flash = 1; AI.hit(src);
+    say('BITTEN', cx(P.x), TOP + P.y * T, '#ff5050'); sfx(120, 'sawtooth', 0.2, 0.25);
+    if (hp <= 0) { over = true; AI.endRun(wave, kills, score); best = Math.max(best, score); try { localStorage.setItem('ud_best', best); } catch (e) {} }
+  }
+
+  function damage(e, dmg, kx, ky, kb, perf) {
+    e.hp -= dmg; e.flash = 1; sfx(300 + Math.random() * 100, 'square', 0.08, 0.1);
+    if (e.hp <= 0) {
+      e.dead = true; kills++; gain(4);
+      if (e.type === 'K') { hp = 5; P.shield = 1; fx.push({ t: 'flash', life: 1 }); say('BOSS DOWN', 480, 300, '#ffd23f'); }
+      else if (Math.random() < 0.14) items.push({ x: e.x, y: e.y, t: ['heart', 'groove', 'shield'][Math.floor(Math.random() * 3)], exp: Math.floor(pos()) + 30 });
+      const p = Math.round(DEF[e.type].pts * (1 + Math.floor(combo / 5)) * (perf ? 1.5 : 1));
+      score += p; say('+' + p, cx(e.x), cy(e.y) - 20, '#ffd23f');
+      return;
+    }
+    for (let i = 0; i < kb; i++) {
+      const nx = e.x + kx, ny = e.y + ky;
+      if (!inB(nx, ny) || occupied(nx, ny)) break;
+      e.x = nx; e.y = ny;
+    }
+  }
+  function sweep() {
+    enemies = enemies.filter(e => !e.dead);
+    if (kills >= wave * 10) { wave++; hp = Math.min(5, hp + 1); say('WAVE ' + wave, 480, 300, '#ff3fa4'); if (wave % 5 === 0) { spawnBoss(); say('BOSS!', 480, 340, '#ffd23f'); } }
+  }
+
+  /* ---------- player actions ---------- */
+  function aim() {
+    const dx = mouse.x - cx(P.x), dy = mouse.y - cy(P.y), ax = Math.abs(dx), ay = Math.abs(dy);
+    const sx = ax > ay * 0.414 ? Math.sign(dx) : 0, sy = ay > ax * 0.414 ? Math.sign(dy) : 0;
+    return sx || sy ? [sx, sy] : P.face;
+  }
+  const cone = a => { const i = RING.findIndex(r => r[0] === a[0] && r[1] === a[1]); return [RING[(i + 7) % 8], RING[i], RING[(i + 1) % 8]]; };
+
+  function move(dir) {
+    if (!running || over) return;
+    const nx = P.x + dir[0], ny = P.y + dir[1];
+    P.face = dir; AI.noteMove(dir);
+    if (inB(nx, ny) && !at(nx, ny)) { P.x = nx; P.y = ny; }
+    if (judge() <= WINDOW) { combo++; gain(2); AI.note(true); }
+    else { AI.note(false); combo = 0; chain = 0; say('off beat', cx(P.x), TOP + P.y * T, '#8a7aa8'); }
+  }
+
+  function act(kind) {
+    if (!running || over) return;
+    const d = judge(), perf = d <= PERFECT, n = Math.floor(pos());
+    const px = cx(P.x), py = TOP + P.y * T;
+    if (d > WINDOW) { AI.note(false); combo = 0; chain = 0; say('OFF BEAT', px, py, '#8a7aa8'); return; }
+    if (P.groove < (COST[kind] || 0)) { say('need groove', px, py, '#8a7aa8'); return; }
+    if (kind === 'dash' && n < dashReady) { say('cooling down', px, py, '#8a7aa8'); return; }
+    AI.note(true); P.groove -= COST[kind] || 0; combo++; gain(perf ? 8 : 5);
+    say(perf ? 'PERFECT' : 'good', px, py, perf ? '#3ff0e0' : '#c9b8ff');
+
+    const strike = (tiles, dmg, kb, c) => {
+      for (const [dx, dy] of tiles) {
+        const x = P.x + dx, y = P.y + dy;
+        if (!inB(x, y)) continue;
+        fx.push({ t: 'tile', x, y, life: 1, c });
+        const e = at(x, y);
+        if (e) damage(e, dmg, Math.sign(dx), Math.sign(dy), kb, perf);
+      }
+    };
+    const a = aim();
+
+    if (kind === 'm1') {
+      P.face = a;
+      const heavy = ++chain % 3 === 0, tiles = cone(a);
+      if (heavy) { tiles.push([a[0] * 2, a[1] * 2]); shake = 8; }
+      strike(tiles, heavy ? 2 : 1, heavy ? 2 : 1, heavy ? '255,63,164' : '255,210,63');
+      if (heavy) say('HEAVY', px, py - 24, '#ff3fa4');
+    } else if (kind === 'spin') {
+      strike(RING, 1, 0, '255,210,63');
+      fx.push({ t: 'ring', x: px, y: cy(P.y), r: 30, v: 6, life: 1, c: '255,210,63' });
+    } else if (kind === 'blast') {
+      const tiles = [];
+      for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) if (dx || dy) tiles.push([dx, dy]);
+      strike(tiles, 2, 2, '63,240,224'); shake = 14;
+      fx.push({ t: 'ring', x: px, y: cy(P.y), r: 30, v: 12, life: 1, c: '63,240,224' });
+      sfx(90, 'sawtooth', 0.3, 0.3);
+    } else if (kind === 'beam') {
+      P.face = a;
+      const tiles = [];
+      for (let i = 1; inB(P.x + a[0] * i, P.y + a[1] * i); i++) tiles.push([a[0] * i, a[1] * i]);
+      strike(tiles, 3, 0, '63,240,224');
+      fx.push({ t: 'beam', x1: px, y1: cy(P.y), x2: px + a[0] * 1000, y2: cy(P.y) + a[1] * 1000, life: 1, c: '255,255,255' });
+      shake = 8; sfx(880, 'sawtooth', 0.3, 0.2);
+    } else if (kind === 'inferno') {
+      for (const e of enemies) damage(e, 5, 0, 0, 0, perf);
+      fx.push({ t: 'flash', life: 1 }); shake = 22; sfx(60, 'sawtooth', 0.6, 0.4);
+    } else if (kind === 'dash') {
+      P.face = a; let land = 0;
+      for (let i = 1; i <= 3; i++) {
+        const x = P.x + a[0] * i, y = P.y + a[1] * i;
+        if (!inB(x, y)) break;
+        const e = at(x, y); if (e) damage(e, 1, a[0], a[1], 0, perf);
+        if (!at(x, y)) land = i;
+      }
+      fx.push({ t: 'beam', x1: px, y1: cy(P.y), x2: cx(P.x + a[0] * land), y2: cy(P.y + a[1] * land), life: 1, c: '63,240,224' });
+      P.x += a[0] * land; P.y += a[1] * land; P.inv = n + 1; dashReady = n + 3;
+      sfx(500, 'sine', 0.15, 0.2);
+    }
+    sweep();
+  }
+
+  /* ---------- enemy beat logic ---------- */
+  function mv(e, sx, sy) { if ((sx || sy) && !occupied(e.x + sx, e.y + sy)) { e.x += sx; e.y += sy; } }
+  function onBeat(n) {
+    if (over) return;
+    AI.tick(hp);
+    const ap = AI.aimPoint();
+    for (const e of enemies) {
+      if (e.dead) continue;
+      e.hop = 1;
+      const dx = P.x - e.x, dy = P.y - e.y, adj = Math.max(Math.abs(dx), Math.abs(dy)) <= 1;
+      if (e.type === 'K') {                              // boss: summons, telegraphs, slams a 5x5 area
+        if (n % 8 === 4) e.charge = true;
+        else if (n % 8 === 6 && e.charge) {
+          e.charge = false; shake = 16; sfx(55, 'sawtooth', 0.4, 0.4);
+          fx.push({ t: 'ring', x: cx(e.x), y: cy(e.y), r: 30, v: 14, life: 1, c: '255,48,48' });
+          if (Math.max(Math.abs(dx), Math.abs(dy)) <= 2) hurt(2, n, 'K');
+          continue;
+        } else if (n % 8 === 0) {
+          let c = 0;
+          for (const [ox, oy] of [[1,0],[-1,0],[0,1],[0,-1]]) if (inB(e.x + ox, e.y + oy) && !occupied(e.x + ox, e.y + oy)) { enemies.push(mk('Z', e.x + ox, e.y + oy)); if (++c >= 2) break; }
+        }
+        if (e.charge) continue;
+      }
+      if (e.type === 'X') {                              // bomber: arms next to you, explodes a beat later
+        if (e.charge) {
+          e.charge = false; e.dead = true; shake = 10; sfx(70, 'sawtooth', 0.3, 0.3);
+          fx.push({ t: 'ring', x: cx(e.x), y: cy(e.y), r: 20, v: 9, life: 1, c: '255,138,40' });
+          if (adj) hurt(2, n, 'X');
+          for (const o of enemies) if (!o.dead && o !== e && Math.max(Math.abs(o.x - e.x), Math.abs(o.y - e.y)) <= 1) damage(o, 2, 0, 0, 0, false);
+          continue;
+        }
+        if (adj && (n + e.off) % 2 === 0) { e.charge = true; continue; }
+      }
+      if (e.type === 'S') {                               // spitter: aligns, telegraphs, fires down its line
+        if (n % 2) continue;
+        const al = dx === 0 || dy === 0;
+        if (e.charge) { e.charge = false; if (al) hurt(1, n, 'S'); continue; }
+        if (al) { e.charge = true; continue; }
+        const ax = ap.x - e.x, ay = ap.y - e.y;
+        let sx = Math.abs(ax) < Math.abs(ay) ? Math.sign(ax) : 0, sy = sx ? 0 : Math.sign(ay);
+        if (!sx && !sy) { sx = Math.abs(dx) < Math.abs(dy) ? Math.sign(dx) : 0; sy = sx ? 0 : Math.sign(dy); }
+        mv(e, sx, sy);
+        continue;
+      }
+      if ((n + e.off) % DEF[e.type].every !== 0) continue;
+      if (adj) { if (e.type !== 'R' || n % 2 === 0) hurt(e.type === 'B' || e.type === 'K' ? 2 : 1, n, e.type); continue; }
+      const lead = e.type === 'R' && (ap.x !== P.x || ap.y !== P.y);
+      const ddx = lead ? ap.x - e.x : dx, ddy = lead ? ap.y - e.y : dy;
+      const horiz = Math.abs(ddx) >= Math.abs(ddy);
+      const tries = horiz ? [[Math.sign(ddx), 0], [0, Math.sign(ddy)]] : [[0, Math.sign(ddy)], [Math.sign(ddx), 0]];
+      for (const [sx, sy] of tries) if ((sx || sy) && !occupied(e.x + sx, e.y + sy)) { e.x += sx; e.y += sy; break; }
+    }
+    enemies = enemies.filter(e => !e.dead); items = items.filter(i => i.exp > n);
+    const cap = Math.max(2, Math.min(16, Math.round((3 + wave * 2) * AI.I)));
+    if (Math.random() < AI.I / (wave >= 4 ? 2 : 4) && enemies.length < cap) spawn();
+  }
+
+  /* ---------- input ---------- */
+  const KEYS = { ArrowUp:[0,-1], w:[0,-1], ArrowDown:[0,1], s:[0,1], ArrowLeft:[-1,0], a:[-1,0], ArrowRight:[1,0], d:[1,0] };
+  const POWER = { ' ': 'spin', q: 'blast', e: 'beam', r: 'inferno' };
+  addEventListener('keydown', ev => {
+    if (ev.repeat) return;
+    const k = ev.key.length === 1 ? ev.key.toLowerCase() : ev.key;
+    if (k === 'p' && running && !over) { paused = !paused; if (paused) ac.suspend(); else ac.resume(); }
+    else if (k === 'm' && master) { muted = !muted; master.gain.value = muted ? 0 : 1; }
+    else if (paused) return;
+    else if (KEYS[k]) { ev.preventDefault(); move(KEYS[k]); }
+    else if (POWER[k]) { ev.preventDefault(); act(POWER[k]); }
+    else if (k === 'Enter' && over) reset();
+    else if (k === 'x' && over) AI.forget();
+  });
+  const toCanvas = ev => { const r = cv.getBoundingClientRect(); return { x: (ev.clientX - r.left) * W / r.width, y: (ev.clientY - r.top) * H / r.height }; };
+  cv.addEventListener('mousemove', ev => { mouse = toCanvas(ev); });
+  cv.addEventListener('mousedown', ev => { ev.preventDefault(); mouse = toCanvas(ev); if (paused) return; if (ev.button === 0) act('m1'); else if (ev.button === 2) act('dash'); });
+  cv.addEventListener('contextmenu', ev => ev.preventDefault());
+
+  /* ---------- render ---------- */
+  function drawEnemy(e, ph) {
+    e.hop *= 0.9; e.flash *= 0.8;
+    const x = cx(e.x), y = cy(e.y) - e.hop * 8, warn = Math.max(Math.abs(P.x - e.x), Math.abs(P.y - e.y)) <= 1;
+    const body = e.flash > 0.1 ? '#fff' : null, eye = warn ? '#ff3030' : '#12061f';
+    if (e.type === 'Z') {
+      g.fillStyle = body || `hsl(${e.hue} 45% 38%)`; g.fillRect(x - 20, y - 22, 40, 44);
+      g.fillStyle = eye; g.fillRect(x - 12, y - 10, 8, 8); g.fillRect(x + 4, y - 10, 8, 8); g.fillRect(x - 10, y + 8, 20, 4);
+    } else if (e.type === 'R') {
+      g.fillStyle = body || '#c8d84a'; g.beginPath(); g.moveTo(x - 14, y + 22); g.lineTo(x + 14, y + 22); g.lineTo(x + 8, y - 22); g.lineTo(x - 18, y - 18); g.fill();
+      g.fillStyle = eye; g.fillRect(x - 10, y - 10, 6, 6); g.fillRect(x + 2, y - 10, 6, 6);
+    } else if (e.type === 'B') {
+      g.fillStyle = body || '#7a3fb0'; g.fillRect(x - 28, y - 28, 56, 56);
+      g.fillStyle = eye; g.fillRect(x - 16, y - 14, 10, 10); g.fillRect(x + 6, y - 14, 10, 10); g.fillRect(x - 14, y + 10, 28, 6);
+      g.fillStyle = '#ffd23f'; for (let i = 0; i < e.hp; i++) g.fillRect(x - 24 + i * 14, y - 36, 10, 5);
+    } else if (e.type === 'X') {
+      g.fillStyle = body || (e.charge && ph < 0.5 ? '#fff' : '#ff8a28'); g.beginPath(); g.arc(x, y, 22, 0, 7); g.fill();
+      g.fillStyle = eye; g.fillRect(x - 10, y - 6, 6, 6); g.fillRect(x + 4, y - 6, 6, 6);
+      if (e.charge) { g.strokeStyle = 'rgba(255,138,40,.85)'; g.lineWidth = 4; g.strokeRect(x - 96, y - 96, 192, 192); }
+    } else if (e.type === 'K') {
+      if (e.charge) { g.fillStyle = 'rgba(255,48,48,.28)'; g.fillRect(x - 160, y - 160, 320, 320); }
+      g.fillStyle = body || '#ffd23f'; g.fillRect(x - 30, y - 30, 60, 60);
+      g.fillStyle = '#ff3fa4'; for (let i = 0; i < 3; i++) g.fillRect(x - 28 + i * 22, y - 44, 12, 14);
+      g.fillStyle = eye; g.fillRect(x - 18, y - 14, 12, 12); g.fillRect(x + 6, y - 14, 12, 12); g.fillRect(x - 16, y + 12, 32, 6);
+      g.fillStyle = '#2a1040'; g.fillRect(x - 30, y + 36, 60, 6); g.fillStyle = '#ff3fa4'; g.fillRect(x - 30, y + 36, 60 * Math.max(e.hp, 0) / e.max, 6);
+    } else {
+      g.fillStyle = body || '#1fa59b'; g.beginPath(); g.moveTo(x, y - 26); g.lineTo(x + 22, y + 22); g.lineTo(x - 22, y + 22); g.fill();
+      g.fillStyle = e.charge ? '#ff3030' : '#12061f'; g.fillRect(x - 8, y - 2, 16, 6);
+      if (e.charge) {                                           // telegraph line to the player
+        g.strokeStyle = `rgba(255,48,48,${0.4 + 0.5 * (1 - ph)})`; g.lineWidth = 6;
+        g.beginPath(); g.moveTo(x, y); g.lineTo(P.x === e.x ? x : (P.x > e.x ? W : 0), P.y === e.y ? y : (P.y > e.y ? H : TOP)); g.stroke();
+      }
+    }
+  }
+
+  function draw() {
+    const ph = phase(), pulse = Math.exp(-5 * ph), n = Math.floor(pos());
+    g.save();
+    if (shake > 0.5) { g.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake); shake *= 0.85; }
+    g.fillStyle = '#12061f'; g.fillRect(-30, -30, W + 60, H + 60);
+
+    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+      g.fillStyle = `hsl(${HUES[(x + y + n) % 4]} 80% ${14 + pulse * 22 + Math.min(combo, 20) / 2}%)`;
+      g.fillRect(x * T + 2, TOP + y * T + 2, T - 4, T - 4);
+    }
+    if (!over) {                                              // aim preview
+      g.strokeStyle = 'rgba(63,240,224,.65)'; g.lineWidth = 3;
+      for (const [dx, dy] of cone(aim())) if (inB(P.x + dx, P.y + dy)) g.strokeRect((P.x + dx) * T + 4, TOP + (P.y + dy) * T + 4, T - 8, T - 8);
+    }
+
+    for (const it of items) {
+      const x = cx(it.x), y = cy(it.y);
+      g.globalAlpha = 0.75 + 0.25 * pulse; g.fillStyle = it.t === 'heart' ? '#ff3fa4' : it.t === 'groove' ? '#ffd23f' : '#3ff0e0';
+      g.beginPath(); g.arc(x, y, 14 + pulse * 4, 0, 7); g.fill(); g.globalAlpha = 1;
+      g.fillStyle = '#12061f'; g.font = `bold 16px ${FONT}`; g.textAlign = 'center'; g.fillText(it.t === 'heart' ? '♥' : it.t === 'groove' ? '♪' : '◈', x, y + 6);
+    }
+    for (const e of enemies) drawEnemy(e, ph);
+
+    const px = cx(P.x), py = cy(P.y), r = 22 + pulse * 5;
+    g.globalAlpha = n <= P.inv ? 0.45 : 1;
+    g.fillStyle = P.flash > 0.1 ? '#ff5050' : '#e8e4f8'; P.flash *= 0.9;
+    g.beginPath(); g.arc(px, py, r, 0, 7); g.fill();
+    g.strokeStyle = '#9a90c0'; g.lineWidth = 1.5;
+    for (let i = -2; i <= 2; i++) { g.beginPath(); g.moveTo(px - r, py + i * 9); g.lineTo(px + r, py + i * 9); g.stroke(); }
+    g.beginPath(); g.moveTo(px, py - r); g.lineTo(px, py + r); g.stroke();
+    g.fillStyle = '#ffd23f'; g.beginPath(); g.arc(px + aim()[0] * (r + 6), py + aim()[1] * (r + 6), 5, 0, 7); g.fill();
+    g.globalAlpha = 1;
+
+    if (P.shield) { g.strokeStyle = '#3ff0e0'; g.lineWidth = 3; g.beginPath(); g.arc(px, py, r + 8, 0, 7); g.stroke(); }
+    fx = fx.filter(f => f.life > 0);
+    for (const f of fx) {
+      f.life -= 0.07;
+      if (f.t === 'tile') { g.fillStyle = `rgba(${f.c},${f.life * .55})`; g.fillRect(f.x * T + 2, TOP + f.y * T + 2, T - 4, T - 4); }
+      else if (f.t === 'ring') { f.r += f.v; g.strokeStyle = `rgba(${f.c},${f.life})`; g.lineWidth = 6; g.beginPath(); g.arc(f.x, f.y, f.r, 0, 7); g.stroke(); }
+      else if (f.t === 'beam') { g.strokeStyle = `rgba(${f.c},${Math.max(f.life, 0)})`; g.lineWidth = 14 * Math.max(f.life, 0); g.beginPath(); g.moveTo(f.x1, f.y1); g.lineTo(f.x2, f.y2); g.stroke(); }
+      else { g.fillStyle = `rgba(255,255,255,${f.life * .8})`; g.fillRect(0, 0, W, H); }
+    }
+
+    g.textAlign = 'center'; g.font = `bold 20px ${FONT}`;
+    msgs = msgs.filter(m => m.life > 0);
+    for (const m of msgs) { m.life -= 0.03; m.y -= 1; g.globalAlpha = Math.max(m.life, 0); g.fillStyle = m.color; g.fillText(m.text, m.x, m.y); }
+    g.globalAlpha = 1;
+
+    // top HUD
+    g.fillStyle = '#12061f'; g.fillRect(0, 0, W, TOP);
+    g.textAlign = 'left'; g.fillStyle = '#ffd23f'; g.font = `italic bold 30px ${FONT}`;
+    g.fillText(String(score).padStart(6, '0'), 20, 42);
+    g.font = `bold 22px ${FONT}`;
+    g.fillStyle = combo >= 5 ? '#3ff0e0' : '#8a7aa8'; g.fillText('combo ' + combo + '  x' + (1 + Math.floor(combo / 5)), 220, 40);
+    g.fillStyle = chain % 3 === 2 ? '#ff3fa4' : '#8a7aa8'; g.fillText('strike ' + (chain % 3) + '/3', 440, 40);
+    g.textAlign = 'right'; g.fillStyle = '#ff3fa4'; g.fillText('wave ' + wave + '   ' + '♥'.repeat(Math.max(hp, 0)) + (P.shield ? ' ◈' : ''), 940, 40);
+    g.textAlign = 'left'; g.font = `bold 14px ${FONT}`; g.fillStyle = '#3ff0e0'; g.fillText('AI x' + AI.I.toFixed(2), 600, 38);
+
+    // bottom panel: beat bar, groove meter, ability chips
+    g.fillStyle = '#12061f'; g.fillRect(0, TOP + ROWS * T, W, 104);
+    const by = 598;
+    g.fillStyle = '#2a1040'; g.fillRect(40, by - 2, 880, 4);
+    for (let k = 0; k < 4; k++) {
+      const dd = (k + (1 - ph)) / 4 * 440;
+      g.fillStyle = `rgba(255,63,164,${1 - k / 4})`;
+      g.fillRect(480 - dd - 5, by - 12, 10, 24); g.fillRect(480 + dd - 5, by - 12, 10, 24);
+    }
+    g.strokeStyle = pulse > 0.5 ? '#ffd23f' : '#3ff0e0'; g.lineWidth = 4; g.strokeRect(458, by - 20, 44, 40);
+
+    g.fillStyle = '#2a1040'; g.fillRect(40, 622, 880, 12);
+    g.fillStyle = P.groove >= 100 ? '#ffd23f' : '#ff3fa4'; g.fillRect(40, 622, 8.8 * P.groove, 12);
+    g.fillStyle = '#f4eeff'; for (const c of [35, 50]) g.fillRect(40 + 8.8 * c - 1, 620, 2, 16);
+
+    const cd = Math.max(0, dashReady - n);
+    const chips = [['Space', 'spin', 0, 0], ['LMB', 'strike', 0, 0], ['RMB', 'dash', 0, cd], ['Q', 'blast', 35, 0], ['E', 'beam', 50, 0], ['R', 'inferno', 100, 0]];
+    g.textAlign = 'left'; g.font = `bold 15px ${FONT}`;
+    chips.forEach(([k, nm, c, w], i) => {
+      const ok = P.groove >= c && !w, x = 30 + i * 150;
+      g.fillStyle = ok ? '#3a1560' : '#1e0c30'; g.fillRect(x, 644, 140, 30);
+      g.fillStyle = ok ? '#f4eeff' : '#5c4a78'; g.fillText(k + ' ' + nm + (c ? ' ' + c : ''), x + 10, 664);
+    });
+
+    if (over) {
+      g.fillStyle = 'rgba(18,6,31,.82)'; g.fillRect(0, 0, W, H);
+      g.textAlign = 'center'; g.fillStyle = '#ff3fa4'; g.font = `italic bold 64px ${FONT}`; g.fillText('THE PARTY IS OVER', 480, 290);
+      g.fillStyle = '#f4eeff'; g.font = `bold 26px ${FONT}`;
+      g.fillText('score ' + score + '   best ' + best + '   wave ' + wave + '   kills ' + kills, 480, 350);
+      g.fillText('press Enter to dance again', 480, 400);
+      g.font = `bold 18px ${FONT}`; g.fillStyle = '#3ff0e0'; g.fillText(AI.report(), 480, 450);
+      g.fillStyle = '#8a7aa8'; g.font = `15px ${FONT}`; g.fillText('the director retunes spawns and enemy aim from how you play.  X forgets what it learned.', 480, 480);
+    }
+    g.restore();
+  }
+
+  /* ---------- loop ---------- */
+  function collect() {
+    items = items.filter(it => {
+      if (it.x !== P.x || it.y !== P.y) return true;
+      if (it.t === 'heart') hp = Math.min(5, hp + 1); else if (it.t === 'groove') gain(30); else P.shield = 1;
+      say(it.t === 'heart' ? '+HEART' : it.t === 'groove' ? '+GROOVE' : 'SHIELD', cx(P.x), TOP + P.y * T, '#3ff0e0'); sfx(880, 'sine', 0.2, 0.2);
+      return false;
+    });
+  }
+  function frame() {
+    if (running) {
+      if (!paused) pumpAudio();
+      const b = Math.floor(pos());
+      while (!paused && lastBeat < b) { lastBeat++; onBeat(lastBeat); }
+      if (!paused && !over) collect();
+      draw();
+      if (paused) { g.fillStyle = 'rgba(18,6,31,.7)'; g.fillRect(0, 0, W, H); g.fillStyle = '#f4eeff'; g.textAlign = 'center'; g.font = `bold 48px ${FONT}`; g.fillText('PAUSED  (P to resume)', 480, 340); }
+    }
+    requestAnimationFrame(frame);
+  }
+  goBtn.onclick = () => {
+    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+    if (!master) { master = ac.createGain(); master.connect(ac.destination); }
+    ac.resume(); reset();
+    t0 = ac.currentTime + 0.4; nextSched = 0; lastBeat = -1;
+    running = true; overlay.style.display = 'none';
+  };
+  reset(); requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
